@@ -82,16 +82,16 @@ jobs:
 
       - name: Compile installer
         shell: pwsh
-        env:
-          AZURE_CONN: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING_BUILD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:AZURE_CONN)) {
-            throw "AZURE_STORAGE_CONNECTION_STRING_BUILD secret is not set"
-          }
+          # Nothing secret is substituted in here -- this installer is a
+          # single public download, identical for every customer. The
+          # only build-time value is the (non-sensitive) Ovenette API
+          # URL. Real credentials (API key, scoped Azure SAS URLs) are
+          # typed/pasted in per-install by the wizard, generated fresh
+          # per-printer from Ovenette's own admin UI.
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $version = "${{ steps.version.outputs.version }}"
           & $iscc `
-            "/DMyAzureConnString=$env:AZURE_CONN" `
             "/DMyApiBaseUrl=https://ovenettebakehouse.com" `
             "/DMyAppVersion=$version" `
             installer\ovenette-print-bridge.iss

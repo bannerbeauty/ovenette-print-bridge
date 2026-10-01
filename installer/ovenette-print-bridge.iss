@@ -6,18 +6,15 @@
 ; ../bridge/), plus NSSM (vendored at ../installer/vendor/nssm.exe) to
 ; install the bridge as a background Windows service.
 ;
-; MyAzureConnString and MyApiBaseUrl are build-time placeholders,
-; substituted via ISCC's /D flag by the release workflow
-; (.github/workflows/release.yml) -- NEVER hardcode a real connection
-; string here. The defaults below (CHANGEME_NOT_SET) make a *local*
-; compile (no /D flags) produce a installer that compiles and the wizard
-; runs end-to-end, but the resulting service will fail its own
-; requireEnv() check at startup rather than silently doing nothing --
-; that's intentional, so a locally-built installer can't be mistaken for
-; a real release.
-#ifndef MyAzureConnString
-  #define MyAzureConnString "CHANGEME_NOT_SET"
-#endif
+; Deliberately NOTHING secret is baked in here -- this installer is a
+; single public download every customer uses, so it's identical for all
+; of them. The one build-time placeholder (MyApiBaseUrl) is the
+; Ovenette app's URL, which isn't sensitive. Every real credential (the
+; printer's API key, and a pair of scoped Azure SAS URLs -- never the
+; account's full connection string) is typed/pasted in by the admin
+; during install, from values generated per-printer in Ovenette's own
+; admin UI (/admin/settings/labels). See bridge/poll-and-print.js's own
+; header comment for why the SAS pair is scoped the way it is.
 #ifndef MyApiBaseUrl
   #define MyApiBaseUrl "https://ovenettebakehouse.com"
 #endif
@@ -75,6 +72,8 @@ Source: "vendor\nssm.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 [Code]
 var
   PrinterInfoPage: TInputQueryWizardPage;
+  SetupCodePage: TWizardPage;
+  SetupCodeMemo: TNewMemo;
   PrinterSelectPage: TWizardPage;
   PrinterCombo: TNewComboBox;
   PrintersDetected: Boolean;
@@ -87,11 +86,24 @@ begin
   PrinterInfoPage := CreateInputQueryPage(wpSelectDir,
     'Printer Information',
     'Enter a name and API key for this printer',
-    'The API key comes from your Ovenette admin account, under Settings > Labels > Printers > Add Printer (or Regenerate API key). It is only ever shown there once, so generate or copy it before continuing.');
+    'Both come from your Ovenette admin account, under Settings > Labels > Printers > Add Printer (or Regenerate API key). The API key is only ever shown there once, so generate or copy it before continuing.');
   PrinterInfoPage.Add('Printer label (for your own reference):', False);
   PrinterInfoPage.Add('API key:', True);
 
-  PrinterSelectPage := CreateCustomPage(PrinterInfoPage.ID,
+  SetupCodePage := CreateCustomPage(PrinterInfoPage.ID,
+    'Setup Code',
+    'Paste the setup code for this printer');
+
+  SetupCodeMemo := TNewMemo.Create(SetupCodePage);
+  SetupCodeMemo.Parent := SetupCodePage.Surface;
+  SetupCodeMemo.Left := 0;
+  SetupCodeMemo.Top := ScaleY(8);
+  SetupCodeMemo.Width := SetupCodePage.SurfaceWidth;
+  SetupCodeMemo.Height := ScaleY(80);
+  SetupCodeMemo.ScrollBars := ssVertical;
+  SetupCodeMemo.WantReturns := True;
+
+  PrinterSelectPage := CreateCustomPage(SetupCodePage.ID,
     'Select Printer',
     'Choose the Windows printer this bridge should send labels to');
 
@@ -165,6 +177,41 @@ begin
     DetectPrinters;
 end;
 
+// Scans the pasted Setup Code block for a "PREFIXvalue" line -- the
+// format Ovenette's admin UI hands out is literally these two lines
+// (see formatSetupCode in admin/settings/labels/actions.ts), so this is
+// a trivial prefix scan, not a general parser. Deliberately not
+// JSON/base64: Inno Setup's Pascal Script has no built-in JSON parser or
+// base64 decoder, and hand-rolling either for an installer that can't be
+// locally compiled/tested outside CI was a worse risk than a plain-text,
+// human-readable format.
+function ExtractSetupValue(const Prefix: String): String;
+var
+  i: Integer;
+  Line: String;
+begin
+  Result := '';
+  for i := 0 to SetupCodeMemo.Lines.Count - 1 do
+  begin
+    Line := Trim(SetupCodeMemo.Lines[i]);
+    if Pos(Prefix, Line) = 1 then
+    begin
+      Result := Copy(Line, Length(Prefix) + 1, MaxInt);
+      Exit;
+    end;
+  end;
+end;
+
+function GetQueueSasUrl(): String;
+begin
+  Result := ExtractSetupValue('QUEUE_SAS_URL=');
+end;
+
+function GetContainerSasUrl(): String;
+begin
+  Result := ExtractSetupValue('CONTAINER_SAS_URL=');
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
@@ -183,6 +230,15 @@ begin
     end;
   end;
 
+  if CurPageID = SetupCodePage.ID then
+  begin
+    if (Pos('https://', GetQueueSasUrl()) <> 1) or (Pos('https://', GetContainerSasUrl()) <> 1) then
+    begin
+      MsgBox('That doesn''t look like a valid setup code. Copy the whole block from Ovenette''s admin -- it should have one QUEUE_SAS_URL= line and one CONTAINER_SAS_URL= line.', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+
   if (CurPageID = PrinterSelectPage.ID) and not PrintersDetected then
   begin
     MsgBox('No Windows printer was detected on this machine. Install your DYMO printer driver first, then re-run this installer.', mbError, MB_OK);
@@ -190,15 +246,16 @@ begin
   end;
 end;
 
-// Writes the real per-customer config: the printer's API key and the
-// exact OS printer name the wizard collected, plus the two build-time
-// values (Azure connection string, Ovenette API URL) substituted by the
-// release workflow. dotenv.config() in poll-and-print.js reads this with
-// no path argument, resolving relative to its own working directory --
-// which NSSM's AppDirectory (set in the [Run] section below) points
-// here, at {app}\bridge. That combination is the specific, previously
-// hard-won fix (see poll-and-print.js's own header comment) for config
-// not reaching the process reliably under NSSM.
+// Writes the real per-customer config: the printer's API key, its two
+// scoped Azure SAS URLs, and the exact OS printer name the wizard
+// collected, plus the one build-time value (the Ovenette API URL --
+// not secret) substituted by the release workflow. dotenv.config() in
+// poll-and-print.js reads this with no path argument, resolving
+// relative to its own working directory -- which NSSM's AppDirectory
+// (set in the [Run] section below) points here, at {app}\bridge. That
+// combination is the specific, previously hard-won fix (see
+// poll-and-print.js's own header comment) for config not reaching the
+// process reliably under NSSM.
 procedure WriteEnvFile;
 var
   EnvPath: String;
@@ -207,7 +264,8 @@ begin
   EnvPath := ExpandConstant('{app}\bridge\.env');
   Lines := TStringList.Create;
   try
-    Lines.Add('AZURE_STORAGE_CONNECTION_STRING=' + '{#MyAzureConnString}');
+    Lines.Add('QUEUE_SAS_URL=' + GetQueueSasUrl());
+    Lines.Add('CONTAINER_SAS_URL=' + GetContainerSasUrl());
     Lines.Add('OVENETTE_API_BASE_URL=' + '{#MyApiBaseUrl}');
     Lines.Add('PRINTER_API_KEY=' + PrinterInfoPage.Values[1]);
     Lines.Add('PRINTER_NAME=' + PrinterCombo.Text);

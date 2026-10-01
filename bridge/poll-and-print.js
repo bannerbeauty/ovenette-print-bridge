@@ -35,11 +35,20 @@ const path = require("path");
 require("dotenv").config();
 const fs = require("fs");
 const os = require("os");
-const { QueueServiceClient } = require("@azure/storage-queue");
-const { BlobServiceClient } = require("@azure/storage-blob");
+const { QueueClient } = require("@azure/storage-queue");
+const { ContainerClient } = require("@azure/storage-blob");
 const { print } = require("pdf-to-printer");
 
-const CONNECTION_STRING = requireEnv("AZURE_STORAGE_CONNECTION_STRING");
+// Scoped SAS URLs, NOT the account's full connection string -- this
+// installer is a public download any customer can run, so each install
+// only ever holds a credential limited to its own printer's queue
+// (read + process, no add/update) and read-only access to the
+// print-job-files container (see src/lib/azure-sas.ts in the main
+// ovenette repo, which generates these). Verified directly, not just
+// assumed: a real cross-queue/cross-container/write attempt with these
+// credentials gets a real 403 from Azure.
+const QUEUE_SAS_URL = requireEnv("QUEUE_SAS_URL");
+const CONTAINER_SAS_URL = requireEnv("CONTAINER_SAS_URL");
 const API_BASE_URL = requireEnv("OVENETTE_API_BASE_URL").replace(/\/+$/, "");
 const PRINTER_API_KEY = requireEnv("PRINTER_API_KEY");
 const PRINTER_NAME = requireEnv("PRINTER_NAME");
@@ -51,7 +60,6 @@ const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 // re-deliver the same message to this same (only) consumer mid-handling.
 const VISIBILITY_TIMEOUT_SECONDS = 30;
 const MAX_MESSAGES_PER_POLL = 10;
-const PRINT_JOB_CONTAINER_NAME = "print-job-files";
 
 let LOG_PREFIX = "[bridge]";
 
@@ -144,10 +152,12 @@ async function markPrinted(printJobId) {
 }
 
 function createClients() {
-  const blobServiceClient = BlobServiceClient.fromConnectionString(CONNECTION_STRING);
-  const containerClient = blobServiceClient.getContainerClient(PRINT_JOB_CONTAINER_NAME);
-  const queueServiceClient = QueueServiceClient.fromConnectionString(CONNECTION_STRING);
-  return { containerClient, queueServiceClient };
+  // Both constructed directly from their SAS URL -- no shared-key
+  // credential object, no account-level client. Each can only ever act
+  // within the single queue/container its own SAS was signed for.
+  const containerClient = new ContainerClient(CONTAINER_SAS_URL);
+  const queueClient = new QueueClient(QUEUE_SAS_URL);
+  return { containerClient, queueClient };
 }
 
 async function handleMessage(message, context) {
@@ -226,18 +236,16 @@ async function main() {
   LOG_PREFIX = `[bridge:${resolvedName || PRINTER_NAME}]`;
   log(`Identified as printerId=${printerId}`);
 
-  const queueName = `print-jobs-${printerId}`;
-  const { containerClient, queueServiceClient } = createClients();
-  const queueClient = queueServiceClient.getQueueClient(queueName);
-  // The queue is normally created on first enqueue (see enqueuePrintJob in
-  // the main app), but may not exist yet on a brand-new printer that's
-  // never had a job queued -- createIfNotExists makes that a no-op
-  // instead of a startup failure.
-  await queueClient.createIfNotExists();
-
+  // Unlike the old connection-string version, this script can't create
+  // its own queue -- the queue SAS is scoped to a specific, already-named
+  // queue, not the account-level create permission. The Ovenette server
+  // guarantees the queue exists before ever handing out a setup code
+  // (see ensureQueueForPrinter, called from both createPrinter and
+  // regeneratePrinterSetupCode), so there's nothing to create here.
+  const { containerClient, queueClient } = createClients();
   const context = { containerClient, queueClient, printerId };
 
-  log(`Queue "${queueName}" ready. Polling...`);
+  log("Polling...");
   for (;;) {
     try {
       await pollOnce(context);
