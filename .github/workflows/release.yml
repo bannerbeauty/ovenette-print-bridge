@@ -16,6 +16,12 @@ on:
 
 jobs:
   build:
+    # The default GITHUB_TOKEN is read-only unless a job explicitly asks
+    # for more -- `gh release create` needs contents: write, confirmed
+    # the hard way (a real run failed with "HTTP 403: Resource not
+    # accessible by integration" without this).
+    permissions:
+      contents: write
     # Inno Setup (ISCC) only runs on Windows -- this also conveniently
     # gives pdf-to-printer's bundled Windows binary and the portable
     # Node runtime a native-matching environment to be packaged from.
