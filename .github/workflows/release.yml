@@ -1,0 +1,128 @@
+name: Release
+
+# Triggered by pushing a version tag (e.g. v1.0.0). workflow_dispatch is
+# also enabled for a manual re-run against an existing tag (e.g. to
+# retry a flaky build without pushing a new tag) -- it takes the same
+# version number as an input since there's no ref-name tag to parse from.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 1.0.0, no leading v)"
+        required: true
+
+jobs:
+  build:
+    # Inno Setup (ISCC) only runs on Windows -- this also conveniently
+    # gives pdf-to-printer's bundled Windows binary and the portable
+    # Node runtime a native-matching environment to be packaged from.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Could not determine a version"
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building version $version"
+
+      - name: Set up Node (for npm install only -- not the bundled runtime)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Install bridge dependencies
+        shell: pwsh
+        run: npm ci --omit=dev
+        working-directory: bridge
+
+      - name: Download portable Node.js runtime to bundle
+        shell: pwsh
+        run: |
+          $index = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json"
+          $lts = $index | Where-Object { $_.lts -ne $false } | Select-Object -First 1
+          $nodeVersion = $lts.version
+          Write-Host "Bundling Node.js $nodeVersion (latest LTS)"
+
+          $zipUrl = "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-win-x64.zip"
+          $zipPath = "$env:RUNNER_TEMP\node.zip"
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+
+          $extractDir = "$env:RUNNER_TEMP\node-extract"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir
+
+          $nodeExe = Get-ChildItem -Path $extractDir -Filter "node.exe" -Recurse | Select-Object -First 1
+          if (-not $nodeExe) { throw "node.exe not found in downloaded archive" }
+
+          New-Item -ItemType Directory -Force -Path installer\node-runtime | Out-Null
+          Copy-Item $nodeExe.FullName installer\node-runtime\node.exe
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        env:
+          AZURE_CONN: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING_BUILD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:AZURE_CONN)) {
+            throw "AZURE_STORAGE_CONNECTION_STRING_BUILD secret is not set"
+          }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $version = "${{ steps.version.outputs.version }}"
+          & $iscc `
+            "/DMyAzureConnString=$env:AZURE_CONN" `
+            "/DMyApiBaseUrl=https://ovenettebakehouse.com" `
+            "/DMyAppVersion=$version" `
+            installer\ovenette-print-bridge.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Produce the two release asset names
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $versioned = "installer\Output\ovenette-printer-setup-$version.exe"
+          $latest = "installer\Output\ovenette-printer-setup-latest.exe"
+          if (-not (Test-Path $versioned)) { throw "Expected build output not found: $versioned" }
+          Copy-Item $versioned $latest
+          Write-Host "Produced:"
+          Get-ChildItem installer\Output\*.exe | ForEach-Object { Write-Host " - $($_.Name) ($($_.Length) bytes)" }
+
+      # Only a real `git tag` push creates a GitHub Release -- a manual
+      # workflow_dispatch run (used to test the build itself) compiles
+      # and uploads the installer as a workflow artifact instead, so
+      # re-testing the build doesn't require cutting a real release.
+      - name: Upload build artifact (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovenette-printer-setup-${{ steps.version.outputs.version }}
+          path: installer\Output\*.exe
+          retention-days: 14
+
+      - name: Publish GitHub Release (tag push only)
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          gh release create "${{ github.ref_name }}" `
+            "installer\Output\ovenette-printer-setup-$version.exe" `
+            "installer\Output\ovenette-printer-setup-latest.exe" `
+            --title "v$version" `
+            --generate-notes

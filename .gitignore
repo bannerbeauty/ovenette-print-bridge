@@ -1,3 +1,10 @@
+# This project's own build artifacts -- the compiled installer output
+# and the portable Node.js runtime the release workflow downloads and
+# stages before compiling (see .github/workflows/release.yml). Neither
+# belongs in git; both are produced fresh on every CI run.
+installer/Output/
+installer/node-runtime/
+
 # Logs
 logs
 *.log

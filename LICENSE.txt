@@ -1,0 +1,24 @@
+Ovenette Print Bridge -- License and Terms
+
+This software is provided by Ovenette Bake House for use by its own
+customers solely to connect a physical DYMO label printer to the
+Ovenette service. It communicates with Ovenette's servers using an API
+key you generate from your own Ovenette admin account.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+By continuing, you agree to install this software, which will run in
+the background as a Windows service and periodically contact Ovenette's
+servers to check for and print label jobs.
+
+This installer bundles the following third-party components under their
+own licenses:
+  - Node.js (https://nodejs.org/) -- MIT-style license
+  - NSSM, the Non-Sucking Service Manager (https://nssm.cc/) -- public
+    domain / free for any use
+  - pdf-to-printer (https://github.com/artiebits/pdf-to-printer) -- MIT
+    license, itself bundling SumatraPDF under GPLv3
