@@ -1,16 +1,15 @@
 {
   "name": "ovenette-print-bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "On-site Windows bridge: polls Ovenette's Azure Storage Queue for print jobs and sends the rendered label PDF to the physical DYMO printer connected to this machine. Ported and simplified from C-Flow's bridge-service -- single printer per install, no multi-instance config needed.",
-  "main": "poll-and-print.js",
+  "description": "Local HTTP print agent: runs on the same machine as the browser printing a label. Accepts a PDF over POST /print and sends it straight to the physical DYMO printer connected to this machine -- no queue, no cloud relay, nothing else involved.",
+  "main": "local-agent.js",
   "scripts": {
-    "start": "node poll-and-print.js"
+    "start": "node local-agent.js"
   },
   "dependencies": {
-    "@azure/storage-queue": "^12.31.0",
-    "@azure/storage-blob": "^12.33.0",
     "dotenv": "^16.4.5",
+    "express": "^4.21.2",
     "pdf-to-printer": "^5.8.0"
   }
 }

@@ -85,15 +85,15 @@ jobs:
         run: |
           # Nothing secret is substituted in here -- this installer is a
           # single public download, identical for every customer. The
-          # only build-time value is the (non-sensitive) Ovenette API
-          # URL. Real credentials (API key, scoped Azure SAS URLs) are
-          # typed/pasted in per-install by the wizard, generated fresh
-          # per-printer from Ovenette's own admin UI.
+          # agent never talks to Ovenette's server at all (see
+          # local-agent.js), so there's no API URL to bake in either --
+          # just the version and the fixed local port, which must match
+          # local-agent.js's own default exactly.
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $version = "${{ steps.version.outputs.version }}"
           & $iscc `
-            "/DMyApiBaseUrl=https://ovenettebakehouse.com" `
             "/DMyAppVersion=$version" `
+            "/DMyAgentPort=17631" `
             installer\ovenette-print-bridge.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 

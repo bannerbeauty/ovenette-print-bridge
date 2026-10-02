@@ -2,27 +2,26 @@
 ;
 ; Builds a self-contained Windows installer: no prerequisites, the
 ; customer just downloads and runs this .exe. Bundles a portable Node.js
-; runtime and the already-`npm install`ed bridge script (see
+; runtime and the already-`npm install`ed local print agent (see
 ; ../bridge/), plus NSSM (vendored at ../installer/vendor/nssm.exe) to
-; install the bridge as a background Windows service.
+; install it as a background Windows service.
 ;
-; Deliberately NOTHING secret is baked in here -- this installer is a
-; single public download every customer uses, so it's identical for all
-; of them. The one build-time placeholder (MyApiBaseUrl) is the
-; Ovenette app's URL, which isn't sensitive. Every real credential (the
-; printer's API key, and a pair of scoped Azure SAS URLs -- never the
-; account's full connection string) is typed/pasted in by the admin
-; during install, from values generated per-printer in Ovenette's own
-; admin UI (/admin/settings/labels). See bridge/poll-and-print.js's own
-; header comment for why the SAS pair is scoped the way it is.
-#ifndef MyApiBaseUrl
-  #define MyApiBaseUrl "https://ovenettebakehouse.com"
-#endif
+; Nothing secret is baked in here or collected by the wizard -- this
+; installer is a single public download every customer uses, identical
+; for all of them. The agent never talks to Ovenette's server at all
+; (see local-agent.js's own header comment for the full architecture);
+; all this installer needs to know is which Windows printer to use and
+; which local port to listen on, both written to a local .env file.
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0-dev"
 #endif
+; Must match local-agent.js's own PORT default exactly -- see that
+; file's comment for why 17631.
+#ifndef MyAgentPort
+  #define MyAgentPort "17631"
+#endif
 
-#define MyAppName "Ovenette Print Bridge"
+#define MyAppName "Ovenette Print Agent"
 #define MyServiceName "OvenettePrintBridge"
 
 [Setup]
@@ -45,14 +44,15 @@ WizardStyle=modern
 ; This is a background-service installer with no user-facing app to
 ; launch afterward, so the usual "Launch program" finish-page checkbox
 ; doesn't apply -- the [Run]/[UninstallRun] sections below handle the
-; service lifecycle instead.
+; service lifecycle instead, and CurPageChanged's health check (below)
+; reports success/failure on the finished page itself.
 DisableWelcomePage=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; The bridge script + its already-installed node_modules (installed by
+; The agent script + its already-installed node_modules (installed by
 ; the release workflow on a Windows runner before compiling, so native/
 ; platform-specific bits -- pdf-to-printer bundles a Windows SumatraPDF
 ; binary -- are correct for this target). .env is deliberately excluded:
@@ -62,8 +62,8 @@ Source: "..\bridge\*"; DestDir: "{app}\bridge"; Flags: recursesubdirs createalls
 ; Portable Node.js runtime, downloaded by the release workflow and
 ; staged into installer\node-runtime\ before compiling (see
 ; .github/workflows/release.yml) -- placed directly alongside
-; poll-and-print.js so the NSSM service's Application path and
-; AppDirectory can both point at the same {app}\bridge folder.
+; local-agent.js so the NSSM service's Application path and AppDirectory
+; can both point at the same {app}\bridge folder.
 Source: "node-runtime\node.exe"; DestDir: "{app}\bridge"; Flags: ignoreversion
 ; NSSM itself, vendored directly in this repo (small, free,
 ; redistributable -- see vendor\README.txt).
@@ -71,41 +71,19 @@ Source: "vendor\nssm.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 [Code]
 var
-  PrinterInfoPage: TInputQueryWizardPage;
-  SetupCodePage: TWizardPage;
-  SetupCodeMemo: TNewMemo;
   PrinterSelectPage: TWizardPage;
   PrinterCombo: TNewComboBox;
   PrintersDetected: Boolean;
+  HealthCheckDone: Boolean;
 
 const
   NoPrintersFoundLabel = '(No printers found -- install your DYMO driver first)';
 
 procedure InitializeWizard;
 begin
-  PrinterInfoPage := CreateInputQueryPage(wpSelectDir,
-    'Printer Information',
-    'Enter a name and API key for this printer',
-    'Both come from your Ovenette admin account, under Settings > Labels > Printers > Add Printer (or Regenerate API key). The API key is only ever shown there once, so generate or copy it before continuing.');
-  PrinterInfoPage.Add('Printer label (for your own reference):', False);
-  PrinterInfoPage.Add('API key:', True);
-
-  SetupCodePage := CreateCustomPage(PrinterInfoPage.ID,
-    'Setup Code',
-    'Paste the setup code for this printer');
-
-  SetupCodeMemo := TNewMemo.Create(SetupCodePage);
-  SetupCodeMemo.Parent := SetupCodePage.Surface;
-  SetupCodeMemo.Left := 0;
-  SetupCodeMemo.Top := ScaleY(8);
-  SetupCodeMemo.Width := SetupCodePage.SurfaceWidth;
-  SetupCodeMemo.Height := ScaleY(80);
-  SetupCodeMemo.ScrollBars := ssVertical;
-  SetupCodeMemo.WantReturns := True;
-
-  PrinterSelectPage := CreateCustomPage(SetupCodePage.ID,
+  PrinterSelectPage := CreateCustomPage(wpSelectDir,
     'Select Printer',
-    'Choose the Windows printer this bridge should send labels to');
+    'Choose the Windows printer this agent should send labels to');
 
   PrinterCombo := TNewComboBox.Create(PrinterSelectPage);
   PrinterCombo.Parent := PrinterSelectPage.Surface;
@@ -115,6 +93,7 @@ begin
   PrinterCombo.Style := csDropDownList;
 
   PrintersDetected := False;
+  HealthCheckDone := False;
 end;
 
 // Queries this machine's actually-installed Windows printers live, via
@@ -171,73 +150,63 @@ begin
   PrinterCombo.ItemIndex := 0;
 end;
 
+// Calls GET /health on the just-started agent and reports success or
+// failure right on the finished page -- a real, immediate confirmation
+// the service actually came up, rather than hoping. Runs from
+// CurPageChanged(wpFinished), since by the time Inno Setup shows that
+// page, the [Run] section's nssm commands (install/configure/start)
+// have already executed -- CurStepChanged(ssPostInstall) fires too
+// early for this, before the service exists to check.
+procedure RunHealthCheck;
+var
+  ResultCode: Integer;
+  TempFile: String;
+  Lines: TStringList;
+  StatusText: String;
+begin
+  TempFile := ExpandConstant('{tmp}\ovenette-health.txt');
+  if FileExists(TempFile) then
+    DeleteFile(TempFile);
+
+  Exec(ExpandConstant('{cmd}'),
+    '/C powershell -NoProfile -Command "try { (Invoke-WebRequest -Uri ''http://127.0.0.1:{#MyAgentPort}/health'' -UseBasicParsing -TimeoutSec 5).StatusCode } catch { ''FAILED'' }" > "' + TempFile + '" 2>&1',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  StatusText := '';
+  if FileExists(TempFile) then
+  begin
+    Lines := TStringList.Create;
+    try
+      Lines.LoadFromFile(TempFile);
+      if Lines.Count > 0 then
+        StatusText := Trim(Lines[0]);
+    finally
+      Lines.Free;
+    end;
+    DeleteFile(TempFile);
+  end;
+
+  if StatusText = '200' then
+    MsgBox('The Ovenette Print Agent started successfully and is responding on port {#MyAgentPort}.', mbInformation, MB_OK)
+  else
+    MsgBox('The print agent may not have started correctly (health check result: ' + StatusText + '). Check the log at ' + ExpandConstant('{app}') + '\bridge\log.txt, or try restarting the "' + '{#MyServiceName}' + '" service from Windows Services.', mbError, MB_OK);
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = PrinterSelectPage.ID) and (PrinterCombo.Items.Count = 0) then
     DetectPrinters;
-end;
 
-// Scans the pasted Setup Code block for a "PREFIXvalue" line -- the
-// format Ovenette's admin UI hands out is literally these two lines
-// (see formatSetupCode in admin/settings/labels/actions.ts), so this is
-// a trivial prefix scan, not a general parser. Deliberately not
-// JSON/base64: Inno Setup's Pascal Script has no built-in JSON parser or
-// base64 decoder, and hand-rolling either for an installer that can't be
-// locally compiled/tested outside CI was a worse risk than a plain-text,
-// human-readable format.
-function ExtractSetupValue(const Prefix: String): String;
-var
-  i: Integer;
-  Line: String;
-begin
-  Result := '';
-  for i := 0 to SetupCodeMemo.Lines.Count - 1 do
+  if (CurPageID = wpFinished) and not HealthCheckDone then
   begin
-    Line := Trim(SetupCodeMemo.Lines[i]);
-    if Pos(Prefix, Line) = 1 then
-    begin
-      Result := Copy(Line, Length(Prefix) + 1, MaxInt);
-      Exit;
-    end;
+    HealthCheckDone := True;
+    RunHealthCheck;
   end;
-end;
-
-function GetQueueSasUrl(): String;
-begin
-  Result := ExtractSetupValue('QUEUE_SAS_URL=');
-end;
-
-function GetContainerSasUrl(): String;
-begin
-  Result := ExtractSetupValue('CONTAINER_SAS_URL=');
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-
-  if CurPageID = PrinterInfoPage.ID then
-  begin
-    if Trim(PrinterInfoPage.Values[0]) = '' then
-    begin
-      MsgBox('Please enter a printer label.', mbError, MB_OK);
-      Result := False;
-    end
-    else if Trim(PrinterInfoPage.Values[1]) = '' then
-    begin
-      MsgBox('Please enter the API key.', mbError, MB_OK);
-      Result := False;
-    end;
-  end;
-
-  if CurPageID = SetupCodePage.ID then
-  begin
-    if (Pos('https://', GetQueueSasUrl()) <> 1) or (Pos('https://', GetContainerSasUrl()) <> 1) then
-    begin
-      MsgBox('That doesn''t look like a valid setup code. Copy the whole block from Ovenette''s admin -- it should have one QUEUE_SAS_URL= line and one CONTAINER_SAS_URL= line.', mbError, MB_OK);
-      Result := False;
-    end;
-  end;
 
   if (CurPageID = PrinterSelectPage.ID) and not PrintersDetected then
   begin
@@ -246,16 +215,15 @@ begin
   end;
 end;
 
-// Writes the real per-customer config: the printer's API key, its two
-// scoped Azure SAS URLs, and the exact OS printer name the wizard
-// collected, plus the one build-time value (the Ovenette API URL --
-// not secret) substituted by the release workflow. dotenv.config() in
-// poll-and-print.js reads this with no path argument, resolving
-// relative to its own working directory -- which NSSM's AppDirectory
-// (set in the [Run] section below) points here, at {app}\bridge. That
-// combination is the specific, previously hard-won fix (see
-// poll-and-print.js's own header comment) for config not reaching the
-// process reliably under NSSM.
+// Writes the real per-customer config: the exact OS printer name the
+// wizard collected, plus the fixed port both this installer and
+// local-agent.js agree on. dotenv.config() in local-agent.js reads this
+// with no path argument, resolving relative to its own working
+// directory -- which NSSM's AppDirectory (set in the [Run] section
+// below) points here, at {app}\bridge. That combination is a
+// specifically hard-won fix (see local-agent.js's own header comment,
+// inherited from this project's earlier C-Flow-derived design) for
+// config not reaching the process reliably under NSSM.
 procedure WriteEnvFile;
 var
   EnvPath: String;
@@ -264,11 +232,8 @@ begin
   EnvPath := ExpandConstant('{app}\bridge\.env');
   Lines := TStringList.Create;
   try
-    Lines.Add('QUEUE_SAS_URL=' + GetQueueSasUrl());
-    Lines.Add('CONTAINER_SAS_URL=' + GetContainerSasUrl());
-    Lines.Add('OVENETTE_API_BASE_URL=' + '{#MyApiBaseUrl}');
-    Lines.Add('PRINTER_API_KEY=' + PrinterInfoPage.Values[1]);
     Lines.Add('PRINTER_NAME=' + PrinterCombo.Text);
+    Lines.Add('PORT=' + '{#MyAgentPort}');
     Lines.SaveToFile(EnvPath);
   finally
     Lines.Free;
@@ -287,11 +252,13 @@ end;
 
 [Run]
 ; Sequential, declarative nssm calls -- install the service pointing
-; node.exe at poll-and-print.js, set its working directory (the
+; node.exe at local-agent.js, set its working directory (the
 ; AppDirectory fix), route its output to a log file, enable auto-start,
 ; then start it immediately. Each waits for the previous to finish
-; (default behavior) since each step depends on the last.
-Filename: "{app}\tools\nssm.exe"; Parameters: "install {#MyServiceName} ""{app}\bridge\node.exe"" ""poll-and-print.js"""; Flags: runhidden waituntilterminated
+; (default behavior) since each step depends on the last. The health
+; check (CurPageChanged above, on the Finished page) runs after all of
+; these have completed.
+Filename: "{app}\tools\nssm.exe"; Parameters: "install {#MyServiceName} ""{app}\bridge\node.exe"" ""local-agent.js"""; Flags: runhidden waituntilterminated
 Filename: "{app}\tools\nssm.exe"; Parameters: "set {#MyServiceName} AppDirectory ""{app}\bridge"""; Flags: runhidden waituntilterminated
 Filename: "{app}\tools\nssm.exe"; Parameters: "set {#MyServiceName} AppStdout ""{app}\bridge\log.txt"""; Flags: runhidden waituntilterminated
 Filename: "{app}\tools\nssm.exe"; Parameters: "set {#MyServiceName} AppStderr ""{app}\bridge\log.txt"""; Flags: runhidden waituntilterminated
