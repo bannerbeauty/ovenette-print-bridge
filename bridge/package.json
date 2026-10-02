@@ -1,6 +1,6 @@
 {
   "name": "ovenette-print-bridge",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "private": true,
   "description": "Local HTTP print agent: runs on the same machine as the browser printing a label. Accepts a PDF over POST /print and sends it straight to the physical DYMO printer connected to this machine -- no queue, no cloud relay, nothing else involved.",
   "main": "local-agent.js",

@@ -359,6 +359,25 @@ Filename: "{app}\tools\nssm.exe"; Parameters: "start {#MyServiceName}"; Flags: r
 ; Stop and remove the service BEFORE [UninstallDelete]/the standard
 ; uninstall process removes {app}'s files -- a leftover orphaned service
 ; pointing at deleted files is a real mess to debug later. RunOnceId is
-; required by Inno Setup for every [UninstallRun] entry.
+; required by Inno Setup for every [UninstallRun] entry. [UninstallRun]
+; entries are guaranteed to execute before any deletion (Inno Setup's
+; documented uninstall order), so nssm.exe is still in place here.
 Filename: "{app}\tools\nssm.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\tools\nssm.exe"; Parameters: "remove {#MyServiceName} confirm"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+
+[UninstallDelete]
+; The standard uninstall process only removes files Inno Setup itself
+; installed via [Files] -- it leaves a directory in place if anything
+; else is sitting in it, and that blocks the "remove now-empty
+; directory" cascade all the way up the tree. This agent writes several
+; things at runtime that were never part of [Files]: .env (written by
+; WriteEnvFile), log.txt and NSSM's rotated log.txt-<timestamp> (AppStdout/
+; AppStderr/AppRotateFiles), and -- found the hard way, via a real
+; uninstall test -- a SumatraPDF-settings file SumatraPDF itself writes
+; the first time it actually prints, nested inside
+; node_modules\pdf-to-printer\dist\. Rather than enumerate every one of
+; those individually (fragile -- a future dependency bump could add
+; another), just force-remove the whole install directory regardless of
+; what's left in it. Safe here since {app} is a dedicated, single-purpose
+; install directory, never a place a user would keep their own files.
+Type: filesandordirs; Name: "{app}"
