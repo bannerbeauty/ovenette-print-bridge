@@ -75,6 +75,11 @@ var
   PrinterCombo: TNewComboBox;
   PrintersDetected: Boolean;
   HealthCheckDone: Boolean;
+  // Captured explicitly in NextButtonClick, at the moment the user
+  // confirms the printer-select page -- see that procedure's own
+  // comment for why this isn't just read from PrinterCombo.Text later.
+  SelectedPrinterName: String;
+  EnvWriteFailed: Boolean;
 
 const
   NoPrintersFoundLabel = '(No printers found -- install your DYMO driver first)';
@@ -94,6 +99,8 @@ begin
 
   PrintersDetected := False;
   HealthCheckDone := False;
+  SelectedPrinterName := '';
+  EnvWriteFailed := False;
 end;
 
 // Queries this machine's actually-installed Windows printers live, via
@@ -200,7 +207,11 @@ begin
   if (CurPageID = wpFinished) and not HealthCheckDone then
   begin
     HealthCheckDone := True;
-    RunHealthCheck;
+    // Skip the redundant generic health-check failure if we already
+    // showed a specific diagnostic for the same root cause in
+    // CurStepChanged.
+    if not EnvWriteFailed then
+      RunHealthCheck;
   end;
 end;
 
@@ -208,10 +219,26 @@ function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
 
-  if (CurPageID = PrinterSelectPage.ID) and not PrintersDetected then
+  if CurPageID = PrinterSelectPage.ID then
   begin
-    MsgBox('No Windows printer was detected on this machine. Install your DYMO printer driver first, then re-run this installer.', mbError, MB_OK);
-    Result := False;
+    if not PrintersDetected then
+    begin
+      MsgBox('No Windows printer was detected on this machine. Install your DYMO printer driver first, then re-run this installer.', mbError, MB_OK);
+      Result := False;
+    end
+    else
+      // A real bug, found the hard way: PrinterCombo.Text did not
+      // reliably reflect a programmatically-set ItemIndex when there was
+      // only one detected printer -- with nothing to actually choose
+      // between, the user never clicks into the dropdown, and this
+      // TNewComboBox's .Text apparently depends on that interaction to
+      // sync, even though .ItemIndex and .Items were both already
+      // correct. Reading Items[ItemIndex] directly sidesteps whatever
+      // internal sync .Text depends on, and capturing it here -- right
+      // when the user confirms this page -- rather than re-reading the
+      // control much later in WriteEnvFile is extra insurance against
+      // the same class of staleness.
+      SelectedPrinterName := PrinterCombo.Items[PrinterCombo.ItemIndex];
   end;
 end;
 
@@ -232,9 +259,48 @@ begin
   EnvPath := ExpandConstant('{app}\bridge\.env');
   Lines := TStringList.Create;
   try
-    Lines.Add('PRINTER_NAME=' + PrinterCombo.Text);
+    Lines.Add('PRINTER_NAME=' + SelectedPrinterName);
     Lines.Add('PORT=' + '{#MyAgentPort}');
     Lines.SaveToFile(EnvPath);
+  finally
+    Lines.Free;
+  end;
+end;
+
+// Reads the just-written .env back and confirms PRINTER_NAME actually
+// landed with a real value -- a direct, specific check, rather than
+// relying solely on the much later GET /health failure to notice
+// something went wrong (that still works as a backstop, but by then the
+// only symptom is a generic "health check failed," with no indication
+// *why*). Deliberately re-parses the file from disk rather than just
+// checking SelectedPrinterName in memory, since the thing actually worth
+// verifying is what WriteEnvFile really wrote, not what we intended to.
+function VerifyEnvFile(): Boolean;
+var
+  EnvPath: String;
+  Lines: TStringList;
+  i: Integer;
+  Prefix: String;
+  Value: String;
+begin
+  Result := False;
+  EnvPath := ExpandConstant('{app}\bridge\.env');
+  if not FileExists(EnvPath) then
+    Exit;
+
+  Prefix := 'PRINTER_NAME=';
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(EnvPath);
+    for i := 0 to Lines.Count - 1 do
+    begin
+      if Pos(Prefix, Lines[i]) = 1 then
+      begin
+        Value := Trim(Copy(Lines[i], Length(Prefix) + 1, MaxInt));
+        Result := Value <> '';
+        Exit;
+      end;
+    end;
   finally
     Lines.Free;
   end;
@@ -247,7 +313,19 @@ begin
   // must never start before .env exists, or NSSM's own restart throttle
   // kicks in against a process that immediately exits via requireEnv().
   if CurStep = ssPostInstall then
+  begin
     WriteEnvFile;
+    if not VerifyEnvFile then
+    begin
+      EnvWriteFailed := True;
+      MsgBox(
+        'The selected printer name was not written to the agent''s configuration file (' +
+        ExpandConstant('{app}') + '\bridge\.env). PRINTER_NAME ended up empty -- the printer ' +
+        'service will not be able to start. Please reinstall and confirm a printer is selected ' +
+        'on the "Select Printer" page before continuing.',
+        mbError, MB_OK);
+    end;
+  end;
 end;
 
 [Run]
