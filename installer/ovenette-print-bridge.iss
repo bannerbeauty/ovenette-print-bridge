@@ -329,6 +329,17 @@ begin
 end;
 
 [Run]
+; Stop and remove any existing service of the same name FIRST -- an
+; upgrade/reinstall over a running install would otherwise hit "nssm
+; install" failing because the service already exists (and "start" on a
+; service still pointed at the old files doing who-knows-what). Same
+; stop-then-remove pattern already proven in [UninstallRun] below, just
+; invoked pre-emptively here too. Harmless on a true fresh install --
+; both calls just fail quietly (service doesn't exist yet) and
+; installation continues normally; Inno Setup doesn't abort the [Run]
+; sequence over a single entry's nonzero exit code.
+Filename: "{app}\tools\nssm.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden waituntilterminated
+Filename: "{app}\tools\nssm.exe"; Parameters: "remove {#MyServiceName} confirm"; Flags: runhidden waituntilterminated
 ; Sequential, declarative nssm calls -- install the service pointing
 ; node.exe at local-agent.js, set its working directory (the
 ; AppDirectory fix), route its output to a log file, enable auto-start,
